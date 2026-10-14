@@ -43,6 +43,7 @@ export default function MapPage() {
   // When a user picks a suggestion, we store the exact coords to avoid re-geocoding
   const selectedOriginCoords = useRef<{ lat: number; lng: number } | null>(null);
   const selectedDestCoords = useRef<{ lat: number; lng: number } | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const setOrigin = useRouteStore((state) => state.setOrigin);
   const setDestination = useRouteStore((state) => state.setDestination);
@@ -123,14 +124,29 @@ export default function MapPage() {
       return;
     }
 
+    // 1. Cancel any previous in-flight search request
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     setIsLoading(true);
     setErrorMsg('');
 
+    // 2. Immediately reset previous routes and safe zone markers so stale data vanishes
+    setRoutes([]);
+    setSafeZones([]);
+    setActiveRouteIndex(0);
+
     try {
-      // 1. Build Origin — use pre-resolved Mapbox coords if available, else Nominatim
+      // 3. Build Origin — use pre-resolved Mapbox coords if available, else Nominatim
       let origin = selectedOriginCoords.current ? { ...selectedOriginCoords.current, address: startQuery } : null;
       if (!origin) {
-        const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(startQuery)}`);
+        const res = await fetch(
+          `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(startQuery)}`,
+          { signal: controller.signal }
+        );
         const data = await res.json();
         if (!data || data.length === 0) throw new Error('Could not find start location.');
         origin = {
@@ -140,10 +156,13 @@ export default function MapPage() {
         };
       }
 
-      // 2. Build Destination — use pre-resolved Mapbox coords if available, else Nominatim
+      // 4. Build Destination — use pre-resolved Mapbox coords if available, else Nominatim
       let dest = selectedDestCoords.current ? { ...selectedDestCoords.current, address: endQuery } : null;
       if (!dest) {
-        const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(endQuery)}`);
+        const res = await fetch(
+          `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(endQuery)}`,
+          { signal: controller.signal }
+        );
         const data = await res.json();
         if (!data || data.length === 0) throw new Error('Could not find destination.');
         dest = {
@@ -156,11 +175,12 @@ export default function MapPage() {
       setOrigin(origin);
       setDestination(dest);
 
-      // 3. Score the route and get safety data
+      // 5. Score the route and get safety data
       const scoreRes = await fetch('/api/routes/score', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ origin, destination: dest }),
+        signal: controller.signal,
       });
 
       if (!scoreRes.ok) {
@@ -180,6 +200,10 @@ export default function MapPage() {
         setErrorMsg('No routes found between these locations.');
       }
     } catch (err: any) {
+      if (err.name === 'AbortError') {
+        // Request was aborted by a new search; ignore silently
+        return;
+      }
       setErrorMsg(err.message || 'Routing failed. Try being more specific with location names.');
     } finally {
       setIsLoading(false);
