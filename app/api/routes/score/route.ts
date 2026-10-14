@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod/v4";
 import { getRoutesFromCoordinates } from "@/lib/routing";
 import { scoreRoute } from "@/lib/safetyEngine";
-import { getAllSafeZones } from "@/mockDB/db";
+import { getSafeZonesNearRoute, type MockSafeZone } from "@/mockDB/db";
 import type { ScoredRoute } from "@/types";
 
 const LatLngSchema = z.object({
@@ -32,12 +32,18 @@ export async function POST(request: NextRequest) {
 
     const routes = await getRoutesFromCoordinates(origin, destination);
 
+    const allGeneratedZones: MockSafeZone[] = [];
+
     const scored = await Promise.all(
       routes.map(async (route, idx) => {
-        const { score, reasonTags } = await scoreRoute({
+        const { score, reasonTags, generatedSafeZones } = await scoreRoute({
           coords: route.coordinates,
           time: new Date(),
         });
+
+        if (generatedSafeZones && generatedSafeZones.length > 0) {
+          allGeneratedZones.push(...generatedSafeZones);
+        }
 
         return {
           coordinates: route.coordinates,
@@ -58,8 +64,11 @@ export async function POST(request: NextRequest) {
     scored.sort((a, b) => b.safetyScore - a.safetyScore);
     if (scored.length > 0) scored[0].isSafest = true;
 
-    // Collect all safe zones (seed + generated during scoring) for map display
-    const safeZones = getAllSafeZones().map((z) => ({
+    // Filter to only safe zones (seed + generated for these routes) within ~5 km of the scored routes
+    const routesCoords = scored.map((r) => r.coordinates);
+    const nearSafeZones = getSafeZonesNearRoute(routesCoords, allGeneratedZones, 5000);
+
+    const safeZones = nearSafeZones.map((z) => ({
       id: z.id,
       name: z.name,
       type: z.type,

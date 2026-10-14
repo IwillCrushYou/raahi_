@@ -1,6 +1,6 @@
 import { supabaseAdmin, hasSupabaseKeys } from "@/lib/supabase";
 import * as turf from "@turf/turf";
-import { generateSafeZonesAlongRoute, countSafeZonesNearby } from "@/mockDB/db";
+import { generateSafeZonesAlongRoute, countSafeZonesNearby, type MockSafeZone } from "@/mockDB/db";
 
 interface ScoreInput {
   coords: [number, number][];
@@ -10,6 +10,7 @@ interface ScoreInput {
 interface ScoreResult {
   score: number;
   reasonTags: string[];
+  generatedSafeZones?: MockSafeZone[];
 }
 
 const WEIGHTS = {
@@ -615,13 +616,13 @@ export async function scoreRoute(input: ScoreInput): Promise<ScoreResult> {
   const popularPlacesFactor = getPopularPlacesScore(coords);
 
   // ── Safe Zone proximity (mock DB — generates + counts, zero async) ──────
-  // Step 1: Generate police stations along this route (grows DB over time)
-  generateSafeZonesAlongRoute(coords);
+  // Step 1: Generate police stations along this route for this request
+  const generatedSafeZones = generateSafeZonesAlongRoute(coords);
 
   // Step 2: Count how many safe zones are near each sampled point
   let totalSafeZones = 0;
   for (const [lat, lng] of sampled) {
-    totalSafeZones += countSafeZonesNearby(lat, lng, SAFE_ZONE_RADIUS_M);
+    totalSafeZones += countSafeZonesNearby(lat, lng, SAFE_ZONE_RADIUS_M, generatedSafeZones);
   }
   const avgSafeZones = totalSafeZones / sampled.length;
   // Scoring: 2+ zones per sample point = 100, 0 zones = 30 (baseline)
@@ -652,5 +653,5 @@ export async function scoreRoute(input: ScoreInput): Promise<ScoreResult> {
     score,
   });
 
-  return { score, reasonTags };
+  return { score, reasonTags, generatedSafeZones };
 }

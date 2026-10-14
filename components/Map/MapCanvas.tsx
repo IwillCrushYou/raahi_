@@ -7,6 +7,7 @@ import { useRouteStore } from '@/lib/store';
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useGeolocation } from '@/hooks/useGeolocation';
 import { LocateFixed } from 'lucide-react';
+import { filterAndSpacePOIs, type POICategoryKey, POI_CONFIG } from '@/lib/poiConfig';
 
 // ✅ MAPBOX CONVERSION — Token from environment variable, not hardcoded
 mapboxgl.accessToken = process.env.NEXT_PUBLIC_MAPBOX_TOKEN ?? '';
@@ -111,6 +112,14 @@ export default function MapCanvas() {
   // ✅ MAPBOX CONVERSION — WebGL support check state
   const [webglSupported, setWebglSupported] = useState(true);
 
+  // Category visibility toggles for the Nearby legend
+  const [activeCategories, setActiveCategories] = useState<Record<POICategoryKey, boolean>>({
+    police_station: true,
+    hospital: true,
+    fire_station: true,
+    transit: true,
+  });
+
   // ── whenMapReady() helper ─────────────────────────────────────────────────
   // ✅ MAPBOX CONVERSION — gates all source/layer calls behind style load
   const whenMapReady = useCallback((fn: (map: mapboxgl.Map) => void) => {
@@ -178,6 +187,10 @@ export default function MapCanvas() {
       originMarkerRef.current = null;
       destMarkerRef.current?.remove();
       destMarkerRef.current = null;
+
+      // Clean up safe zone markers
+      for (const m of safeZoneMarkersRef.current) m.remove();
+      safeZoneMarkersRef.current = [];
 
       prevRouteCount.current = 0;
       map.remove();
@@ -438,13 +451,24 @@ export default function MapCanvas() {
     if (!mapRef.current) return;
     const map = mapRef.current;
 
-    // Remove previous safe zone markers
+    // Explicitly remove previous safe zone markers before creating new ones
     for (const m of safeZoneMarkersRef.current) m.remove();
     safeZoneMarkersRef.current = [];
 
     if (safeZones.length === 0) return;
 
-    for (const zone of safeZones) {
+    // Active route coordinates (or first route if index out of bounds)
+    const activeRouteCoords = routes[activeRouteIndex]?.coordinates;
+
+    // Filter, space out, and cap POIs along the active route
+    const displayZones = filterAndSpacePOIs(
+      safeZones,
+      activeRouteCoords,
+      activeCategories,
+      POI_CONFIG
+    );
+
+    for (const zone of displayZones) {
       // Subtle color by type
       const dotColor =
         zone.type === 'police_station' ? '#3b82f6' :
@@ -458,18 +482,33 @@ export default function MapCanvas() {
         zone.type === 'fire_station' ? '🚒' :
         zone.type === 'railway_station' ? '🚉' : '🚏';
 
-      // Tiny 12px dot — no border, just a subtle filled circle
+      const typeTitle =
+        zone.type === 'police_station' ? 'Police Station' :
+        zone.type === 'hospital' ? 'Hospital' :
+        zone.type === 'fire_station' ? 'Fire Station' :
+        'Transit';
+
+      // Tiny 10px dot — subtle filled circle with slight shadow
       const el = document.createElement('div');
-      el.style.cssText = `width:10px;height:10px;border-radius:50%;background:${dotColor};opacity:0.55;cursor:default;`;
+      el.style.cssText = `width:10px;height:10px;border-radius:50%;background:${dotColor};box-shadow:0 1px 4px rgba(0,0,0,0.25);cursor:pointer;transition:transform 0.15s ease;`;
       el.title = `${typeEmoji} ${zone.name}`;
+      el.onmouseenter = () => { el.style.transform = 'scale(1.35)'; };
+      el.onmouseleave = () => { el.style.transform = 'scale(1)'; };
+
+      const popup = new mapboxgl.Popup({
+        offset: 8,
+        closeButton: false,
+        className: 'raahi-popup',
+      }).setHTML(createPopupHTML(typeTitle, zone.name, dotColor));
 
       const marker = new mapboxgl.Marker({ element: el })
         .setLngLat([zone.lng, zone.lat])
+        .setPopup(popup)
         .addTo(map);
 
       safeZoneMarkersRef.current.push(marker);
     }
-  }, [safeZones]);
+  }, [safeZones, routes, activeRouteIndex, activeCategories]);
 
   // ── Locate Me handler ──────────────────────────────────────────────────────
   const handleLocateMe = useCallback(() => {
@@ -517,14 +556,42 @@ export default function MapCanvas() {
         </button>
       )}
 
-      {/* Safe Zone Legend */}
+      {/* Safe Zone Legend with Interactive Category Toggles */}
       {safeZones.length > 0 && (
-        <div className="absolute bottom-4 left-3 z-[1000] bg-white/90 backdrop-blur-sm rounded-lg shadow-sm border border-gray-200/60 px-3 py-2 text-[10px] space-y-1">
-          <span className="font-bold text-[#374151] uppercase tracking-wider block mb-1">Nearby</span>
-          <div className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-[#3b82f6] inline-block" />Police Station</div>
-          <div className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-[#ef4444] inline-block" />Hospital</div>
-          <div className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-[#f59e0b] inline-block" />Fire Station</div>
-          <div className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-[#059669] inline-block" />Transit</div>
+        <div className="absolute bottom-4 left-3 z-[1000] bg-white/95 backdrop-blur-md rounded-xl shadow-md border border-gray-200/80 px-3 py-2.5 text-[11px] space-y-1.5 select-none transition-all">
+          <span className="font-bold text-[#374151] uppercase tracking-wider block text-[10px] mb-1">Nearby</span>
+          <button
+            type="button"
+            onClick={() => setActiveCategories((prev) => ({ ...prev, police_station: !prev.police_station }))}
+            className={`flex items-center gap-1.5 w-full text-left transition-opacity hover:opacity-100 ${activeCategories.police_station ? 'opacity-100 font-medium text-gray-800' : 'opacity-40 text-gray-400 line-through'}`}
+            title="Click to toggle Police Stations"
+          >
+            <span className="w-2 h-2 rounded-full bg-[#3b82f6] shrink-0 inline-block" />Police Station
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveCategories((prev) => ({ ...prev, hospital: !prev.hospital }))}
+            className={`flex items-center gap-1.5 w-full text-left transition-opacity hover:opacity-100 ${activeCategories.hospital ? 'opacity-100 font-medium text-gray-800' : 'opacity-40 text-gray-400 line-through'}`}
+            title="Click to toggle Hospitals"
+          >
+            <span className="w-2 h-2 rounded-full bg-[#ef4444] shrink-0 inline-block" />Hospital
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveCategories((prev) => ({ ...prev, fire_station: !prev.fire_station }))}
+            className={`flex items-center gap-1.5 w-full text-left transition-opacity hover:opacity-100 ${activeCategories.fire_station ? 'opacity-100 font-medium text-gray-800' : 'opacity-40 text-gray-400 line-through'}`}
+            title="Click to toggle Fire Stations"
+          >
+            <span className="w-2 h-2 rounded-full bg-[#f59e0b] shrink-0 inline-block" />Fire Station
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveCategories((prev) => ({ ...prev, transit: !prev.transit }))}
+            className={`flex items-center gap-1.5 w-full text-left transition-opacity hover:opacity-100 ${activeCategories.transit ? 'opacity-100 font-medium text-gray-800' : 'opacity-40 text-gray-400 line-through'}`}
+            title="Click to toggle Transit"
+          >
+            <span className="w-2 h-2 rounded-full bg-[#059669] shrink-0 inline-block" />Transit
+          </button>
         </div>
       )}
     </div>

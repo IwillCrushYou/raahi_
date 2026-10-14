@@ -147,15 +147,6 @@ const SEED_SAFE_ZONES: MockSafeZone[] = [
 // RUNTIME STORE — Grows over time as routes are scored
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/** All zones: seed + dynamically generated. Persists across requests in dev. */
-const allSafeZones: MockSafeZone[] = [...SEED_SAFE_ZONES];
-
-/** Track generated zone positions to avoid duplicates (uses grid key) */
-const generatedGrid = new Set<string>();
-
-/** Counter for unique IDs */
-let genCounter = 0;
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // HAVERSINE DISTANCE
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -203,17 +194,16 @@ const SAFE_ZONE_TYPES: MockSafeZone["type"][] = [
 ];
 
 /**
- * Generate random safe zones along a route's coordinates.
- * - Sprinkles one station every ~800m to 1.5km along the route
+ * Generate random safe zones along a route's coordinates for THIS request.
+ * Does NOT mutate global state.
+ * - Sprinkles one station every ~2km to 4km along the route
  * - Offsets them 50-400m perpendicular to the route (realistic placement)
- * - Deduplicates using a spatial grid (~200m cells) so the same area
- *   doesn't get flooded with stations across multiple scorings
- * - Returns count of NEW stations added this call
+ * - Returns generated stations for this route
  */
 export function generateSafeZonesAlongRoute(
   coords: [number, number][]
-): number {
-  if (coords.length < 4) return 0;
+): MockSafeZone[] {
+  if (coords.length < 4) return [];
 
   // Create a seed from the first and last coordinate for determinism
   const seedVal = Math.abs(
@@ -224,11 +214,14 @@ export function generateSafeZonesAlongRoute(
   );
   const rng = seededRandom(seedVal);
 
+  const generatedZones: MockSafeZone[] = [];
+  const localGrid = new Set<string>();
+  let localCounter = 0;
+
   let distAccum = 0;
-  const INTERVAL_MIN = 2000;  // meters — minimum distance between generated stations
-  const INTERVAL_MAX = 4000;  // meters — maximum distance
+  const INTERVAL_MIN = 2500;  // meters — minimum distance between generated stations
+  const INTERVAL_MAX = 5000;  // meters — maximum distance
   let nextThreshold = INTERVAL_MIN + rng() * (INTERVAL_MAX - INTERVAL_MIN);
-  let newCount = 0;
 
   for (let i = 1; i < coords.length; i++) {
     const [lat1, lng1] = coords[i - 1];
@@ -252,9 +245,9 @@ export function generateSafeZonesAlongRoute(
 
       // Dedup: grid key at ~200m resolution
       const gridKey = `${(stationLat * 500).toFixed(0)},${(stationLng * 500).toFixed(0)}`;
-      if (!generatedGrid.has(gridKey)) {
-        generatedGrid.add(gridKey);
-        genCounter++;
+      if (!localGrid.has(gridKey)) {
+        localGrid.add(gridKey);
+        localCounter++;
 
         const typeIdx = Math.floor(rng() * SAFE_ZONE_TYPES.length);
         const nameIdx = Math.floor(rng() * POLICE_STATION_NAMES.length);
@@ -262,12 +255,12 @@ export function generateSafeZonesAlongRoute(
         const baseName = type === "police_station"
           ? POLICE_STATION_NAMES[nameIdx]
           : type === "hospital"
-            ? `Area Hospital #${genCounter}`
-            : `Fire Station #${genCounter}`;
+            ? `Area Hospital #${localCounter}`
+            : `Fire Station #${localCounter}`;
 
         const zone: MockSafeZone = {
-          id: `gen-${genCounter}`,
-          name: `${baseName} (Zone ${genCounter})`,
+          id: `gen-${localCounter}`,
+          name: `${baseName} (Zone ${localCounter})`,
           type,
           lat: +stationLat.toFixed(6),
           lng: +stationLng.toFixed(6),
@@ -277,8 +270,7 @@ export function generateSafeZonesAlongRoute(
           generated: true,
         };
 
-        allSafeZones.push(zone);
-        newCount++;
+        generatedZones.push(zone);
       }
 
       distAccum = 0;
@@ -286,13 +278,7 @@ export function generateSafeZonesAlongRoute(
     }
   }
 
-  if (newCount > 0) {
-    console.log(
-      `[mockDB] Generated ${newCount} safe zones along route (total DB: ${allSafeZones.length})`
-    );
-  }
-
-  return newCount;
+  return generatedZones;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -301,15 +287,21 @@ export function generateSafeZonesAlongRoute(
 
 /**
  * Count how many safe zones are within `radiusM` meters of (lat, lng).
- * Scans ALL zones: seed + generated. Pure synchronous — no DB call.
+ * Checks seed safe zones + any generated safe zones passed in for this route.
  */
 export function countSafeZonesNearby(
   lat: number,
   lng: number,
-  radiusM: number = 300
+  radiusM: number = 300,
+  localZones: readonly MockSafeZone[] = []
 ): number {
   let count = 0;
-  for (const zone of allSafeZones) {
+  for (const zone of SEED_SAFE_ZONES) {
+    if (haversineMeters(lat, lng, zone.lat, zone.lng) <= radiusM) {
+      count++;
+    }
+  }
+  for (const zone of localZones) {
     if (haversineMeters(lat, lng, zone.lat, zone.lng) <= radiusM) {
       count++;
     }
@@ -318,29 +310,80 @@ export function countSafeZonesNearby(
 }
 
 /**
- * Get all safe zones within `radiusM` meters of (lat, lng).
- * Returns full zone objects (for display on map markers, etc.)
+ * Get all safe zones (seed + generated) within `maxDistM` meters of any of the given routes.
+ * Uses bounding-box pre-filtering followed by sampled coordinate distance.
  */
-export function getSafeZonesNearby(
-  lat: number,
-  lng: number,
-  radiusM: number = 500
+export function getSafeZonesNearRoute(
+  routesCoordinates: [number, number][][],
+  generatedZones: MockSafeZone[] = [],
+  maxDistM: number = 5000
 ): MockSafeZone[] {
-  return allSafeZones.filter(
-    (zone) => haversineMeters(lat, lng, zone.lat, zone.lng) <= radiusM
-  );
+  if (routesCoordinates.length === 0) return [];
+
+  // 1. Calculate overall bounding box of all routes with a ~0.06 deg buffer (~6.5 km)
+  let minLat = Infinity, maxLat = -Infinity;
+  let minLng = Infinity, maxLng = -Infinity;
+
+  for (const coords of routesCoordinates) {
+    for (const [lat, lng] of coords) {
+      if (lat < minLat) minLat = lat;
+      if (lat > maxLat) maxLat = lat;
+      if (lng < minLng) minLng = lng;
+      if (lng > maxLng) maxLng = lng;
+    }
+  }
+
+  const degBuffer = (maxDistM / 111000) * 1.3;
+  minLat -= degBuffer;
+  maxLat += degBuffer;
+  minLng -= degBuffer;
+  maxLng += degBuffer;
+
+  // Flatten and dedup candidate pool
+  const candidatePool: MockSafeZone[] = [...SEED_SAFE_ZONES, ...generatedZones];
+  const seenIds = new Set<string>();
+  const results: MockSafeZone[] = [];
+
+  for (const zone of candidatePool) {
+    if (seenIds.has(zone.id)) continue;
+
+    // Fast bounding box reject
+    if (
+      zone.lat < minLat ||
+      zone.lat > maxLat ||
+      zone.lng < minLng ||
+      zone.lng > maxLng
+    ) {
+      continue;
+    }
+
+    // Check distance to route coordinates
+    let isNear = false;
+    for (const coords of routesCoordinates) {
+      const step = coords.length > 200 ? Math.ceil(coords.length / 200) : 1;
+      for (let i = 0; i < coords.length; i += step) {
+        const [rLat, rLng] = coords[i];
+        if (haversineMeters(zone.lat, zone.lng, rLat, rLng) <= maxDistM) {
+          isNear = true;
+          break;
+        }
+      }
+      if (isNear) break;
+    }
+
+    if (isNear) {
+      seenIds.add(zone.id);
+      results.push(zone);
+    }
+  }
+
+  return results;
 }
 
 /**
- * Get current total safe zone count (seed + generated).
- */
-export function getTotalSafeZoneCount(): number {
-  return allSafeZones.length;
-}
-
-/**
- * Get all safe zones (for debugging / admin views).
+ * Get static seed safe zones (for debugging / admin views).
  */
 export function getAllSafeZones(): readonly MockSafeZone[] {
-  return allSafeZones;
+  return SEED_SAFE_ZONES;
 }
+
